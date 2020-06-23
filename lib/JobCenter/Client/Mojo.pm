@@ -1,7 +1,7 @@
 package JobCenter::Client::Mojo;
 use Mojo::Base 'Mojo::EventEmitter';
 
-our $VERSION = '0.35'; # VERSION
+our $VERSION = '0.40'; # VERSION
 
 #
 # Mojo's default reactor uses EV, and EV does not play nice with signals
@@ -32,12 +32,12 @@ use Sys::Hostname;
 use JSON::RPC2::TwoWay 0.02;
 # JSON::RPC2::TwoWay depends on JSON::MaybeXS anyways, so it can be used here
 # without adding another dependency
-use JSON::MaybeXS qw(decode_json encode_json);
+use JSON::MaybeXS qw(JSON decode_json encode_json);
 use MojoX::NetstringStream 0.06; # for the enhanced close
 
 has [qw(
-	actions address auth clientid conn daemon debug jobs json lastping
-	log method ns ping_timeout port rpc timeout tls token who
+	actions address auth clientid conn debug ioloop jobs json
+	lastping log method ns ping_timeout port rpc timeout tls token who
 )];
 
 # keep in sync with the jobcenter
@@ -53,6 +53,7 @@ sub new {
 
 	my $address = $args{address} // '127.0.0.1';
 	my $debug = $args{debug} // 0; # or 1?
+	$self->{ioloop} = $args{ioloop} // Mojo::IOLoop->singleton;
 	my $json = $args{json} // 1;
 	my $log = $args{log} // Mojo::Log->new(level => ($debug) ? 'debug' : 'info');
 	my $method = $args{method} // 'password';
@@ -66,7 +67,6 @@ sub new {
 	my $who = $args{who} or croak 'no who?';
 
 	$self->{address} = $address;
-	$self->{daemon} = $args{daemon} // 0;
 	$self->{debug} = $args{debug} // 1;
 	$self->{jobs} = {};
 	$self->{json} = $json;
@@ -94,15 +94,14 @@ sub new {
 sub connect {
 	my $self = shift;
 
-	delete $self->{_exit};
+	delete $self->ioloop->{__exit__};
 	delete $self->{auth};
 	$self->{actions} = {};
 
 	$self->on(disconnect => sub {
 		my ($self, $code) = @_;
-		$self->{_exit} = $code;
-		Mojo::IOLoop->stop;
-		#exit(1);
+		#$self->{_exit} = $code;
+		$self->ioloop->stop;
 	});
 
 	my $rpc = JSON::RPC2::TwoWay->new(debug => $self->{debug}) or croak 'no rpc?';
@@ -120,7 +119,7 @@ sub connect {
 	$clarg->{tls_cert} = $self->{tls_cert} if $self->{tls_cert};
 	$clarg->{tls_key} = $self->{tls_key} if $self->{tls_key};
 
-	my $clientid = Mojo::IOLoop->client(
+	my $clientid = $self->ioloop->client(
 		$clarg => sub {
 		my ($loop, $err, $stream) = @_;
 		if ($err) {
@@ -144,6 +143,10 @@ sub connect {
 			$ns->close if $err[0];
 		});
 		$ns->on(close => sub {
+			# this cb is called during global destruction, at
+			# least on old perls where
+			# Mojo::Util::_global_destruction() won't work
+			return unless $conn;
 			$conn->close;
 			$self->log->info('connection to API closed');
 			$self->emit(disconnect => WORK_CONNECTION_CLOSED); # todo doc
@@ -154,7 +157,7 @@ sub connect {
 	$self->{clientid} = $clientid;
 
 	# handle timeout?
-	my $tmr = Mojo::IOLoop->timer($self->{timeout} => sub {
+	my $tmr = $self->ioloop->timer($self->{timeout} => sub {
 		my $loop = shift;
 		$self->log->error('timeout wating for greeting');
 		$loop->remove($clientid);
@@ -167,18 +170,19 @@ sub connect {
 
 	$self->log->debug('done with handhake?');
 
-	Mojo::IOLoop->remove($tmr);
+	$self->ioloop->remove($tmr);
+	$self->unsubscribe('disconnect');
 	1;
 }
 
 sub is_connected {
 	my $self = shift;
-	return $self->{auth} && !$self->{_exit};
+	return $self->{auth} && !$self->ioloop->{__exit__};
 }
 
 sub rpc_greetings {
 	my ($self, $c, $i) = @_;
-	Mojo::IOLoop->delay->steps(
+	$self->ioloop->delay(
 		sub {
 			my $d = shift;
 			die "wrong api version $i->{version} (expected 1.1)" unless $i->{version} eq '1.1';
@@ -201,7 +205,7 @@ sub rpc_greetings {
 			}
 		}
 	)->catch(sub {
-		my ($delay, $err) = @_;
+		my ($err) = @_;
 		$self->log->error('something went wrong in handshake: ' . $err);
 		$self->{auth} = '';
 	});
@@ -254,12 +258,17 @@ sub call_nb {
 	my $rescb = $args{cb2} // die 'no result callback?';
 	my $timeout = $args{timeout} // $self->timeout * 5; # a bit hackish..
 	my $reqauth = $args{reqauth};
+	my $clenv = $args{clenv};
 	my $inargsj;
 
 	if ($self->{json}) {
 		$inargsj = $inargs;
 		$inargs = decode_json($inargs);
 		croak 'inargs is not a json object' unless ref $inargs eq 'HASH';
+		if ($clenv) {
+			$clenv = decode_json($clenv);
+			croak 'clenv is not a json object' unless ref $clenv eq 'HASH';
+		}
 		if ($reqauth) {
 			$reqauth = decode_json($reqauth);
 			croak 'reqauth is not a json object' unless ref $reqauth eq 'HASH';
@@ -268,6 +277,9 @@ sub call_nb {
 		croak 'inargs should be a hashref' unless ref $inargs eq 'HASH';
 		# test encoding
 		$inargsj = encode_json($inargs);
+		if ($clenv) {
+			croak 'clenv should be a hashref' unless ref $clenv eq 'HASH';
+		}
 		if ($reqauth) {
 			croak 'reqauth should be a hashref' unless ref $reqauth eq 'HASH';
 		}
@@ -276,7 +288,7 @@ sub call_nb {
 	$inargsj = decode_utf8($inargsj);
 	$self->log->debug("calling $wfname with '" . $inargsj . "'" . (($vtag) ? " (vtag $vtag)" : ''));
 
-	my $delay = Mojo::IOLoop->delay->steps(
+	$self->ioloop->delay(
 		sub {
 			my $d = shift;
 			$self->conn->call('create_job', {
@@ -284,6 +296,7 @@ sub call_nb {
 				vtag => $vtag,
 				inargs => $inargs,
 				timeout => $timeout,
+				($clenv ? (clenv => $clenv) : ()),
 				($reqauth ? (reqauth => $reqauth) : ()),
 			}, $d->begin(0));
 		},
@@ -309,7 +322,7 @@ sub call_nb {
 			$callcb->($job_id, $msg);
 		}
 	)->catch(sub {
-		my ($delay, $err) = @_;
+		my ($err) = @_;
 		$self->log->error("Something went wrong in call_nb: $err");
 		$err = { error => $err };
 		$err = encode_json($err) if $self->{json};
@@ -334,7 +347,7 @@ sub find_jobs {
 	$filter = encode_json($filter) if ref $filter eq 'HASH';
 
 	my ($done, $err, $jobs);
-	Mojo::IOLoop->delay->steps(
+	$self->ioloop->delay(
 	sub {
 		my $d = shift;
 		# fixme: check results?
@@ -344,16 +357,16 @@ sub find_jobs {
 		#say 'find_jobs call returned: ', Dumper(\@_);
 		my ($d, $e, $r) = @_;
 		if ($e) {
-			$self->log->debug("find_jobs got error $e");
-			$err = $e;
+			$self->log->error("find_jobs got error $e->{message} ($e->{code})");
+			$err = $e->{message};
 			$done++;
 			return;
 		}
 		$jobs = $r;
 		$done++;
 	})->catch(sub {
-		my ($d, $err) = @_;
-		$self->log->debug("something went wrong with get_job_status: $err");
+		my ($err) = @_;
+		$self->log->error("something went wrong with get_job_status: $err");
 		$done++;
 	});
 
@@ -368,7 +381,7 @@ sub get_api_status {
 	croak('no what?') unless $what;
 
 	my $result;
-	Mojo::IOLoop->delay->steps(
+	$self->ioloop->delay(
 	sub {
 		my $d = shift;
 		$self->conn->call('get_api_status', { what => $what }, $d->begin(0));
@@ -377,8 +390,8 @@ sub get_api_status {
 		#say 'call returned: ', Dumper(\@_);
 		my ($d, $e, $r) = @_;
 		if ($e) {
-			$self->log->debug("get_api_status got error $e");
-			$result = $e;
+			$self->log->error("get_api_status got error $e->{message} ($e->{code})");
+			$result = $e->{message};
 			return;
 		}
 		$result = $r;
@@ -395,34 +408,66 @@ sub get_job_status {
 	croak('no job_id?') unless $job_id;
 
 	my ($done, $job_id2, $outargs);
-	Mojo::IOLoop->delay->steps(
+	$self->get_job_status_nb(
+		job_id => $job_id,
+		statuscb => sub {
+			($job_id2, $outargs) = @_;
+			$done++;
+			return;
+		},
+	);
+	$self->_loop(sub { !$done });
+	return $job_id2, $outargs;
+}
+
+sub get_job_status_nb {
+	my ($self, %args) = @_;
+	my $job_id = $args{job_id} or
+		croak('no job_id?');
+
+	my $statuscb = $args{statuscb};
+	croak('statuscb should be a coderef')
+		if ref $statuscb ne 'CODE';
+
+	my $notifycb = $args{notifycb};
+	croak('notifycb should be a coderef')
+		if $notifycb and ref $notifycb ne 'CODE';
+
+	#my ($done, $job_id2, $outargs);
+	$self->ioloop->delay(
 	sub {
 		my $d = shift;
 		# fixme: check results?
-		$self->conn->call('get_job_status', { job_id => $job_id }, $d->begin(0));
+		$self->conn->call(
+			'get_job_status', {
+				job_id => $job_id,
+				notify => ($notifycb ? JSON->true : JSON->false),
+			}, $d->begin(0)
+		);
 	},
 	sub {
 		#say 'call returned: ', Dumper(\@_);
 		my ($d, $e, $r) = @_;
+		#$self->log->debug("get_job_satus_nb got job_id: $res msg: $msg");
 		if ($e) {
-			$self->log->debug("get_job_status got error $e");
-			$outargs = $e;
-			$done++;
+			$self->log->error("get_job_status got error $e->{message} ($e->{code})");
+			$statuscb->(undef, $e->{message});
 			return;
 		}
-		($job_id2, $outargs) = @$r;
-		#$self->log->debug("get_job_satus got job_id: $res msg: $msg");
-		$done++;
+		my ($job_id2, $outargs) = @$r;
+		if ($notifycb and !$job_id2 and !$outargs) {
+			$self->jobs->{$job_id} = $notifycb;
+		}
+		$outargs = encode_json($outargs) if $self->{json} and ref $outargs;
+		$statuscb->($job_id2, $outargs);
+		return;
 	})->catch(sub {
-		my ($d, $err) = @_;
-		$self->log->debug("something went wrong with get_job_status: $err");
-		$done++;
+		my ($err) = @_;
+		$self->log->error("Something went wrong in get_job_status_nb: $err");
+		$err = { error => $err };
+		$err = encode_json($err) if $self->{json};
+		$statuscb->(undef, $err);
 	});
-
-	$self->_loop(sub { !$done });
-
-	$outargs = encode_json($outargs) if $self->{json} and ref $outargs;
-	return $job_id2, $outargs;
 }
 
 sub ping {
@@ -431,7 +476,7 @@ sub ping {
 	$timeout //= $self->timeout;
 	my ($done, $ret);
 
-	Mojo::IOLoop->timer($timeout => sub {
+	$self->ioloop->timer($timeout => sub {
 		$done++;
 	});
 
@@ -451,32 +496,68 @@ sub ping {
 }
 
 sub work {
-	my ($self) = @_;
-	if ($self->daemon) {
-		_daemonize();
-	}
+	my ($self, $prepare) = @_;
 
 	my $pt = $self->ping_timeout;
 	my $tmr;
-	$tmr = Mojo::IOLoop->recurring($pt => sub {
+	$tmr = $self->ioloop->recurring($pt => sub {
 		my $ioloop = shift;
 		$self->log->debug('in ping_timeout timer: lastping: '
 			 . ($self->lastping // 0) . ' limit: ' . (time - $pt) );
 		return if ($self->lastping // 0) > time - $pt;
 		$self->log->error('ping timeout');
 		$ioloop->remove($self->clientid);
-		$self->{_exit} = WORK_PING_TIMEOUT; # todo: doc
 		$ioloop->remove($tmr);
+		$ioloop->{__exit__} = WORK_PING_TIMEOUT; # todo: doc
 		$ioloop->stop;
 	}) if $pt > 0;
+	$self->on(disconnect => sub {
+		my ($self, $code) = @_;
+		$self->ioloop->{__exit__} = $code;
+		$self->ioloop->stop;
+	});
+	return 0 if $prepare;
 
-	$self->{_exit} = WORK_OK;
+	$self->ioloop->{__exit__} = WORK_OK;
 	$self->log->debug('JobCenter::Client::Mojo starting work');
-	Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
+	$self->ioloop->start unless Mojo::IOLoop->is_running;
 	$self->log->debug('JobCenter::Client::Mojo done?');
-	Mojo::IOLoop->remove($tmr) if $tmr;
+	$self->ioloop->remove($tmr) if $tmr;
 
-	return $self->{_exit};
+	return $self->ioloop->{__exit__};
+}
+
+sub stop {
+	my ($self, $exit) = @_;
+	$self->ioloop->{__exit__} = $exit;
+	$self->ioloop->stop;
+}
+
+sub create_slotgroup {
+	my ($self, $name, $slots) = @_;
+	croak('no slotgroup name?') unless $name;
+
+	my $result;
+	$self->ioloop->delay(
+	sub {
+		my $d = shift;
+		$self->conn->call('create_slotgroup', { name => $name, slots => $slots }, $d->begin(0));
+	},
+	sub {
+		#say 'call returned: ', Dumper(\@_);
+		my ($d, $e, $r) = @_;
+		if ($e) {
+			$self->log->error("create_slotgroup got error $e->{message}");
+			$result = $e->{message};
+			return;
+		}
+		$result = $r;
+	})->catch(sub {
+		my ($err) = @_;
+		$self->log->eror("something went wrong with create_slotgroup: $err");
+	})->wait();
+
+	return $result;
 }
 
 sub announce {
@@ -487,21 +568,21 @@ sub announce {
 	my $mode = $args{mode} // (($args{async}) ? 'async' : 'sync');
 	croak "unknown callback mode $mode" unless $mode =~ /^(subproc|async|sync)$/;
 	my $undocb = $args{undocb};
-	my $slots = $args{slots} // 1;
 	my $host = hostname;
 	my $workername = $args{workername} // "$self->{who} $host $0 $$";
 
 	croak "already have action $actionname" if $self->actions->{$actionname};
 
 	my $err;
-	Mojo::IOLoop->delay->steps(
+	$self->ioloop->delay(
 	sub {
 		my $d = shift;
 		# fixme: check results?
 		$self->conn->call('announce', {
 				 workername => $workername,
 				 actionname => $actionname,
-				 slots => $slots,
+				 slotgroup => $args{slotgroup},
+				 slots => $args{slots},
 				 (($args{filter}) ? (filter => $args{filter}) : ()),
 			}, $d->begin(0));
 	},
@@ -509,8 +590,9 @@ sub announce {
 		#say 'call returned: ', Dumper(\@_);
 		my ($d, $e, $r) = @_;
 		if ($e) {
-			$self->log->debug("announce got error $e");
-			$err = $e;
+			$self->log->error("announce got error: $e->{message}");
+			$err = $e->{message};
+			return;
 		}
 		my ($res, $msg) = @$r;
 		$self->log->debug("announce got res: $res msg: $msg");
@@ -519,12 +601,11 @@ sub announce {
 			mode => $mode,
 			undocb => $undocb,
 			addenv => $args{addenv} // 0,
-			slots => $slots } if $res;
+		} if $res;
 		$err = $msg unless $res;
 	})->catch(sub {
-		my $d;
-		($d, $err) = @_;
-		$self->log->debug("something went wrong with announce: $err");
+		($err) = @_;
+		$self->log->error("something went wrong with announce: $err");
 	})->wait();
 
 	return $err;
@@ -548,7 +629,7 @@ sub rpc_task_ready {
 	}
 
 	$self->log->debug("got task_ready for $actionname job_id $job_id calling get_task");
-	Mojo::IOLoop->delay->steps(sub {
+	$self->ioloop->delay(sub {
 		my $d = shift;
 		$c->call('get_task', {actionname => $actionname, job_id => $job_id}, $d->begin(0));
 	},
@@ -589,6 +670,9 @@ sub rpc_task_ready {
 		} else {
 			die "unkown mode $action->{mode}";
 		}
+	})->catch(sub {
+		my ($err) = @_;
+		$self->log->error("something went wrong with rpc_task_ready: $err");
 	});
 }
 
@@ -596,7 +680,7 @@ sub _subproc {
 	my ($self, $c, $action, $job_id, $cookie, @args) = @_;
 
 	# based on Mojo::IOLoop::Subprocess
-	my $ioloop = Mojo::IOLoop->singleton;
+	my $ioloop = $self->ioloop;
 
 	# Pipe for subprocess communication
 	pipe(my $reader, my $writer) or die "Can't create pipe: $!";
@@ -666,26 +750,11 @@ sub _subproc {
 	);
 }
 
-# copied from Mojo::Server
-sub _daemonize {
-	use POSIX;
-
-	# Fork and kill parent
-	die "Can't fork: $!" unless defined(my $pid = fork);
-	exit 0 if $pid;
-	POSIX::setsid or die "Can't start a new session: $!";
-
-	# Close filehandles
-	open STDIN,  '</dev/null';
-	open STDOUT, '>/dev/null';
-	open STDERR, '>&STDOUT';
-}
-
 # tick while Mojo::Reactor is still running and condition callback is true
 sub _loop {
 	warn __PACKAGE__." recursing into IO loop" if state $looping++;
 
-	my $reactor = Mojo::IOLoop->singleton->reactor;
+	my $reactor = $_[0]->ioloop->singleton->reactor;
 	my $err;
 
 	if (ref $reactor eq 'Mojo::Reactor::EV') {
@@ -799,6 +868,10 @@ Valid arguments are:
 
 (default: false)
 
+=item - ioloop: L<Mojo::IOLoop> object to use
+
+(per default the L<Mojo::IOLoop>->singleton object is used)
+
 =item - json: flag wether input is json or perl.
 
 when true expects the inargs to be valid json, when false a perl hashref is
@@ -843,6 +916,9 @@ Valid arguments are:
 =item - reqauth: authentication token to be passed on to the authentication
 module of the API for per job/request authentication.
 
+=item - clenv: client environment, made available as part of the job
+environment and inherited to child jobs.
+
 =back
 
 =head2 call_nb
@@ -881,6 +957,36 @@ message.  If the job has not finished executing then both $job_id and
 $result will be undefined.  Otherwise the $result will contain the result of
 the job.  (Which may be a JobCenter error object)
 
+=head2 get_job_status_nb
+
+$client->get_job_status_nb(%args);
+
+Retrieves the status for the given $job_id.
+
+Valid arguments are:
+
+=over 4
+
+=item - job_id
+
+=item - statuscb: coderef to the callback for the current status
+
+( statuscb => sub { ($job_id, $result) = @_; ... } )
+
+If the job_id does not exist then the returned $job_id will be undefined
+and $result will be an error message.  If the job has not finished executing
+then both $job_id and $result will be undefined.  Otherwise the $result will
+contain the result of the job.  (Which may be a JobCenter error object)
+
+=item - notifycb: coderef to the callback for job completion
+
+( statuscb => sub { ($job_id, $result) = @_; ... } )
+
+If the job was still running when the get_job_status_nb call was made then
+this callback will be called on completion of the job.
+
+=back
+
 =head2 find_jobs
 
 ($err, @jobs) = $client->find_jobs({'foo'=>'bar'});
@@ -904,6 +1010,13 @@ $client->close()
 
 Closes the connection to the JobCenter API and tries to de-allocate
 everything.  Trying to use the client afterwards will produce errors.
+
+=head2 create_slotgroup
+
+$client->create_slotgroup($name, $slots)
+
+A 'slotgroup' is a way of telling the JobCenter API how many taskss the
+worker can do at once.  The number of slots should be a positive integer.
 
 =head2 announce
 
@@ -963,14 +1076,19 @@ some Mojo-callbacks.
 
 (optional, default false)
 
+=item - slotgroup: the slotgroup to use for accounting of parrallel tasks
+
+(optional, conflicts with 'slots')
+
 =item - slots: the amount of tasks the worker is able to process in parallel
 for this action.
 
-(optional, default 1)
+(optional, default 1, conflicts with 'slotgroup')
 
 =item - undocb: a callback that gets called when the original callback
-returns an error object or throws an error.  Called with the same arguments
-as the original callback.
+returns an error object or throws an error.
+
+Called with the same arguments as the original callback.
 
 (optional, only valid for mode 'subproc')
 
@@ -997,6 +1115,20 @@ callback mode the environment will be inserted before the result callback.
 Starts the L<Mojo::IOLoop>.  Returns a non-zero value when the IOLoop was
 stopped due to some error condition (like a lost connection or a ping
 timeout).
+
+=head3 Possible work() exit codes
+
+The JobCenter::Client::Mojo library currently defines the following exit codes:
+
+	WORK_OK
+	WORK_PING_TIMEOUT
+	WORK_CONNECTION_CLOSED
+
+=head2 stop
+
+  $client->stop($exit);
+
+Makes the work() function exit with the provided exit code.
 
 =head1 SEE ALSO
 
